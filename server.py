@@ -3,9 +3,9 @@ aiaware/server.py — AI content awareness pipeline.
 FastAPI on port 11440 (pipeline) or 10073 (reader/70-machine).
 
 AIAWARE_MODE=pipeline  (default) — full pipeline: Whisper + Ollama + daily scheduler
-AIAWARE_MODE=reader               — static reader: serves catalog.json pushed by pipeline machine
+AIAWARE_MODE=reader               — static reader: serves episodes.db pushed by pipeline machine
 """
-import json, sys, re, os, threading, time, subprocess, urllib.request, urllib.error
+import json, sys, re, os, threading, time, subprocess, sqlite3, urllib.request, urllib.error
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
@@ -22,12 +22,16 @@ LOCAL_DIR    = Path("/mnt/d/ai/local")
 PROJECT_DIR  = Path(os.environ.get("AIAWARE_DIR", "/mnt/d/ai/aiaware"))
 OUTPUT_DIR   = LOCAL_DIR / "output"
 FEEDS_FILE   = PROJECT_DIR / "feeds.json"
-CATALOG_FILE = PROJECT_DIR / "catalog.json"
+
+# SQLite — local DB (pipeline: in project dir; reader: in data dir set by env)
+_data_dir    = os.environ.get("AIAWARE_DATA_DIR", str(PROJECT_DIR))
+DB_FILE      = Path(_data_dir) / "episodes.db"
 
 # Remote 70-machine sync (pipeline mode only)
-REMOTE_HOST      = os.environ.get("AIAWARE_REMOTE_HOST", "root@70.36.101.83")
-REMOTE_CATALOG   = os.environ.get("AIAWARE_REMOTE_CATALOG", "~/aiaware/catalog.json")
-REMOTE_SSH_KEY   = os.environ.get("AIAWARE_SSH_KEY", "/home/rwheeler/.ssh/granbury_70")
+REMOTE_HOST        = os.environ.get("AIAWARE_REMOTE_HOST",    "root@70.36.101.83")
+REMOTE_SYNC_SCRIPT = os.environ.get("AIAWARE_SYNC_SCRIPT",    "/root/aiaware/db_sync.py")
+REMOTE_SSH_KEY     = os.environ.get("AIAWARE_SSH_KEY",        "/home/rwheeler/.ssh/granbury_70")
+REMOTE_READER_URL  = os.environ.get("AIAWARE_REMOTE_URL",     "https://aiaware.stinkhead.net")
 
 WHISPER_PY    = Path("/home/rwheeler/whisper-4090-venv/bin/python")
 TRANSCRIBE_PY = LOCAL_DIR / "transcribe_wsl.py"
@@ -68,7 +72,7 @@ Rules:
 - If the video is thin on substance, say so plainly in TL;DR
 """
 
-app = FastAPI(title="AIAware", version="2.0")
+app = FastAPI(title="AIAware", version="3.0")
 app.mount("/static", StaticFiles(directory=str(PROJECT_DIR / "static")), name="static")
 
 _jobs: dict[str, dict] = {}
@@ -77,13 +81,101 @@ _running_vid: Optional[str] = None
 _lock = threading.Lock()
 _done_today: set[str] = set()
 
+DB_KEYS = ['vid','title','upload_date','channel','channel_url','url','analysis',
+           'status','feed_name','started_at','completed_at','updated_at']
+
 
 class TriggerRequest(BaseModel):
     url: Optional[str] = None
     force: bool = False
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+def _init_db():
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(DB_FILE))
+    con.execute('''CREATE TABLE IF NOT EXISTS episodes (
+        vid TEXT PRIMARY KEY,
+        title TEXT,
+        upload_date TEXT,
+        channel TEXT,
+        channel_url TEXT,
+        url TEXT,
+        analysis TEXT,
+        status TEXT DEFAULT 'ready',
+        feed_name TEXT,
+        started_at TEXT,
+        completed_at TEXT,
+        updated_at TEXT
+    )''')
+    con.commit()
+    con.close()
+
+
+def _upsert_episode(job: dict):
+    con = sqlite3.connect(str(DB_FILE))
+    con.execute(
+        f"INSERT OR REPLACE INTO episodes ({','.join(DB_KEYS)}) "
+        f"VALUES ({','.join(':'+k for k in DB_KEYS)})",
+        {k: job.get(k) for k in DB_KEYS},
+    )
+    con.commit()
+    con.close()
+
+
+def _load_from_db() -> list[dict]:
+    if not DB_FILE.exists():
+        return []
+    try:
+        con = sqlite3.connect(str(DB_FILE))
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT * FROM episodes WHERE status='ready' "
+            "ORDER BY upload_date DESC, updated_at DESC"
+        ).fetchall()
+        con.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[db] load error: {e}", flush=True)
+        return []
+
+
+def _sync_episode_remote(job: dict):
+    """Push one episode to 70-machine SQLite via SSH + db_sync.py."""
+    payload = json.dumps({k: job.get(k) for k in DB_KEYS}).encode()
+    cmd = [
+        "ssh", "-i", REMOTE_SSH_KEY,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ConnectTimeout=10",
+        REMOTE_HOST,
+        f"python3 {REMOTE_SYNC_SCRIPT}",
+    ]
+    try:
+        r = subprocess.run(cmd, input=payload, capture_output=True, timeout=20)
+        if r.returncode == 0:
+            print(f"[sync] {job.get('vid')} -> remote DB: {r.stdout.decode().strip()}", flush=True)
+        else:
+            print(f"[sync] WARNING: {r.stderr.decode().strip()}", flush=True)
+    except Exception as e:
+        print(f"[sync] WARNING: {e}", flush=True)
+
+
+def _trigger_remote_reload():
+    """Tell reader node to refresh _jobs from its DB."""
+    try:
+        req = urllib.request.Request(
+            f"{REMOTE_READER_URL}/api/reload",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            print(f"[sync] remote reload: {json.loads(r.read())}", flush=True)
+    except Exception as e:
+        print(f"[sync] reload WARNING: {e}", flush=True)
+
+
+# ── misc helpers ──────────────────────────────────────────────────────────────
 
 def _load_feeds() -> list[dict]:
     if not FEEDS_FILE.exists():
@@ -145,47 +237,7 @@ def _get_meta(vid: str) -> dict:
     return {"title": vid, "upload_date": "", "channel": "", "channel_url": ""}
 
 
-def _save_catalog():
-    """Persist all completed episodes (including full analysis) to catalog.json."""
-    with _lock:
-        episodes = [dict(j) for j in _jobs.values() if j.get("status") == "ready"]
-    episodes.sort(key=lambda e: e.get("upload_date", ""), reverse=True)
-    CATALOG_FILE.write_text(json.dumps(episodes, indent=2), encoding="utf-8")
-
-
-def _sync_to_remote():
-    """Push catalog.json to 70 machine via SSH. Fire-and-forget on failure."""
-    if not CATALOG_FILE.exists():
-        return
-    try:
-        data = CATALOG_FILE.read_bytes()
-        cmd = [
-            "ssh", "-i", REMOTE_SSH_KEY,
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ConnectTimeout=10",
-            REMOTE_HOST,
-            f"cat > {REMOTE_CATALOG}",
-        ]
-        r = subprocess.run(cmd, input=data, timeout=20)
-        if r.returncode == 0:
-            print(f"[sync] catalog pushed to {REMOTE_HOST}", flush=True)
-        else:
-            print(f"[sync] WARNING: SSH returned {r.returncode}", flush=True)
-    except Exception as e:
-        print(f"[sync] WARNING: {e}", flush=True)
-
-
-def _load_catalog() -> list[dict]:
-    """Reader-mode: load episodes from catalog.json."""
-    if not CATALOG_FILE.exists():
-        return []
-    try:
-        return json.loads(CATALOG_FILE.read_text())
-    except Exception:
-        return []
-
-
-# ── pipeline (pipeline mode only) ────────────────────────────────────────────
+# ── pipeline ──────────────────────────────────────────────────────────────────
 
 def _run_transcribe(url: str) -> tuple[bool, str, Optional[Path]]:
     vid = _video_id(url)
@@ -292,14 +344,16 @@ def _process_job(url: str, feed_name: str = "manual"):
                 "title": meta["title"],
                 "upload_date": meta["upload_date"],
                 "channel": meta["channel"],
+                "channel_url": meta.get("channel_url", ""),
                 "updated_at": datetime.now().isoformat(),
                 "completed_at": datetime.now().isoformat(),
             })
             _done_today.add(feed_name)
             _latest_vid = vid
 
-        _save_catalog()
-        _sync_to_remote()
+        _upsert_episode(_jobs[vid])
+        _sync_episode_remote(_jobs[vid])
+        _trigger_remote_reload()
 
     except Exception as e:
         print(f"[job] ERROR: {e}", flush=True)
@@ -364,49 +418,68 @@ def _scheduler():
 
 def _startup_recover_pipeline():
     global _latest_vid
-    loaded = []
+    _init_db()
+
+    # Load what's already in the DB (fast path)
+    existing = {ep["vid"]: ep for ep in _load_from_db()}
+    _jobs.update(existing)
+
+    # Scan .aiaware.txt files for anything not yet in DB
+    new_jobs = []
     for apath in OUTPUT_DIR.glob("*/*.aiaware.txt"):
         vid = apath.parent.name
+        if vid in existing:
+            continue
         try:
             raw = apath.read_text(encoding="utf-8")
             url = next((l[5:].strip() for l in raw.splitlines()[:5] if l.startswith("URL: ")), "")
             analysis = raw.split("--- ANALYSIS ---", 1)[1].strip() if "--- ANALYSIS ---" in raw else raw
             meta = _get_meta(vid)
             mtime = apath.stat().st_mtime
-            _jobs[vid] = {
+            job = {
                 "vid": vid, "url": url, "feed_name": "restored",
                 "status": "ready", "step": "done",
                 "analysis": analysis,
                 "title": meta["title"], "upload_date": meta["upload_date"],
-                "channel": meta["channel"], "error": None,
+                "channel": meta["channel"], "channel_url": meta.get("channel_url", ""),
+                "error": None,
                 "started_at": datetime.fromtimestamp(mtime).isoformat(),
                 "updated_at": datetime.fromtimestamp(mtime).isoformat(),
                 "completed_at": datetime.fromtimestamp(mtime).isoformat(),
             }
-            loaded.append((meta["upload_date"] or datetime.fromtimestamp(mtime).isoformat(), vid))
+            _jobs[vid] = job
+            _upsert_episode(job)
+            new_jobs.append(job)
         except Exception as e:
             print(f"[startup] skip {apath}: {e}", flush=True)
-    if loaded:
-        loaded.sort(reverse=True)
-        _latest_vid = loaded[0][1]
-        print(f"[startup] restored {len(loaded)} episodes, latest: {_latest_vid}", flush=True)
-        _save_catalog()
-        _sync_to_remote()
+
+    if _jobs:
+        _latest_vid = sorted(
+            _jobs.keys(),
+            key=lambda v: _jobs[v].get("upload_date", ""),
+            reverse=True,
+        )[0]
+
+    print(f"[startup] pipeline: {len(existing)} from DB, {len(new_jobs)} new from disk, latest: {_latest_vid}", flush=True)
+
+    # Sync any newly discovered episodes to remote
+    for job in new_jobs:
+        _sync_episode_remote(job)
+    if new_jobs:
+        _trigger_remote_reload()
 
 
 def _startup_recover_reader():
-    """Reader mode: load from catalog.json pushed by pipeline machine."""
     global _latest_vid
-    episodes = _load_catalog()
+    _init_db()
+    episodes = _load_from_db()
     for ep in episodes:
         vid = ep.get("vid")
         if vid:
             _jobs[vid] = ep
     if episodes:
         _latest_vid = episodes[0].get("vid")
-        print(f"[startup] reader: loaded {len(episodes)} episodes from catalog", flush=True)
-    else:
-        print("[startup] reader: catalog.json empty or missing — waiting for sync", flush=True)
+    print(f"[startup] reader: {len(episodes)} episodes from DB", flush=True)
 
 
 # ── startup ───────────────────────────────────────────────────────────────────
@@ -418,7 +491,7 @@ def startup():
         threading.Thread(target=_scheduler, daemon=True).start()
     else:
         _startup_recover_reader()
-    print(f"[startup] AIAware v2 mode={MODE} port={PORT}", flush=True)
+    print(f"[startup] AIAware v3 mode={MODE} port={PORT}", flush=True)
 
 
 # ── routes ────────────────────────────────────────────────────────────────────
@@ -479,11 +552,11 @@ def trigger(req: TriggerRequest, background_tasks: BackgroundTasks):
 
 @app.post("/api/reload")
 def reload_catalog():
-    """Reader mode: reload catalog.json from disk (called after remote sync)."""
+    """Reader mode: reload _jobs from local DB (called after db_sync.py writes a new episode)."""
     if MODE == "pipeline":
         return JSONResponse({"error": "Not in reader mode"}, status_code=400)
     global _latest_vid
-    episodes = _load_catalog()
+    episodes = _load_from_db()
     with _lock:
         _jobs.clear()
         for ep in episodes:
