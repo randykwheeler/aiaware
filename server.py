@@ -162,15 +162,21 @@ def _sync_episode_remote(job: dict):
 
 
 def _trigger_remote_reload():
-    """Tell reader node to refresh _jobs from its DB."""
+    """Tell reader node to refresh _jobs from its DB via SSH localhost (bypasses Cloudflare)."""
+    remote_port = os.environ.get("AIAWARE_REMOTE_PORT", "10073")
+    cmd = [
+        "ssh", "-i", REMOTE_SSH_KEY,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ConnectTimeout=10",
+        REMOTE_HOST,
+        f"curl -sf -X POST http://localhost:{remote_port}/api/reload",
+    ]
     try:
-        req = urllib.request.Request(
-            f"{REMOTE_READER_URL}/api/reload",
-            data=b"{}",
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            print(f"[sync] remote reload: {json.loads(r.read())}", flush=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            print(f"[sync] remote reload: {r.stdout.strip()}", flush=True)
+        else:
+            print(f"[sync] reload WARNING: {r.stderr.strip()}", flush=True)
     except Exception as e:
         print(f"[sync] reload WARNING: {e}", flush=True)
 
