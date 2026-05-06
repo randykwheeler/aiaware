@@ -1,0 +1,9 @@
+[
+  {
+    "name": "AI News & Strategy Daily | Nate B Jones",
+    "channel": "@NateBJones",
+    "url": "https://www.youtube.com/channel/UC0C-17n9iuUQPylguM1d-lQ/videos",
+    "schedule_hour": 10,
+    "note": "Daily AI strategy/news channel. yt-dlp pulls latest video automatically."
+  }
+]

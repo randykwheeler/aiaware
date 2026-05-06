@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AIAware</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <div class="brand">
+      <span class="brand-icon">&#11042;</span>
+      <span class="brand-name">AIAware</span>
+      <span class="brand-sub">Intelligence Briefings</span>
+    </div>
+    <div class="header-right">
+      <span id="status-pill" class="pill">loading</span>
+      <span id="server-time" class="htime"></span>
+      <button id="trigger-btn" type="button" class="btn-trigger">&#9654; Run Now</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <main class="main-panel">
+
+    <!-- Video embed -->
+    <div id="video-wrap" class="video-wrap hidden">
+      <div class="video-container">
+        <iframe id="video-iframe"
+          src=""
+          title="Video player"
+          frameborder="0"
+          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+          allowfullscreen>
+        </iframe>
+      </div>
+    </div>
+
+    <!-- Meta bar -->
+    <div id="meta-bar" class="meta-bar hidden">
+      <div class="meta-left">
+        <span id="video-title" class="video-title"></span>
+        <span id="video-date" class="video-date"></span>
+      </div>
+      <a id="video-link" href="#" target="_blank" class="video-link">&#9654; YouTube</a>
+    </div>
+
+    <!-- Content -->
+    <div id="content-area">
+      <div id="loading-state" class="loading-state">
+        <div class="spinner"></div>
+        <div class="loading-text">
+          <p id="loading-msg">Waiting for analysis...</p>
+          <p id="loading-sub" class="loading-sub"></p>
+        </div>
+      </div>
+      <div id="analysis-content" class="analysis hidden"></div>
+    </div>
+
+  </main>
+
+  <aside class="sidebar">
+    <div class="sidebar-card">
+      <h3>Pipeline</h3>
+      <div class="pipeline">
+        <div class="p-step" id="ps-transcribe">
+          <div class="p-dot"></div>
+          <div class="p-info">
+            <span class="p-name">Transcribe</span>
+            <span class="p-detail">4090 Whisper distil-large-v3</span>
+          </div>
+        </div>
+        <div class="p-connector"></div>
+        <div class="p-step" id="ps-analyze">
+          <div class="p-dot"></div>
+          <div class="p-info">
+            <span class="p-name">Analyze</span>
+            <span class="p-detail">Ollama gemma4:e4b</span>
+          </div>
+        </div>
+        <div class="p-connector"></div>
+        <div class="p-step" id="ps-highlights">
+          <div class="p-dot"></div>
+          <div class="p-info">
+            <span class="p-name">Highlights</span>
+            <span class="p-detail">6-section brief</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sidebar-card episodes-card">
+      <h3>Episodes <span id="ep-count" class="ep-count"></span></h3>
+      <div id="episodes-list"><p class="empty-msg">Loading...</p></div>
+    </div>
+  </aside>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

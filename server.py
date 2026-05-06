@@ -1,0 +1,446 @@
+"""
+aiaware/server.py — AI content awareness pipeline.
+FastAPI on port 11440. Transcribes + analyzes daily AI videos via 4090 Whisper + Ollama.
+"""
+import json, sys, re, threading, time, subprocess, urllib.request, urllib.error
+from datetime import datetime, date
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
+
+PORT        = 11440
+LOCAL_DIR   = Path("/mnt/d/ai/local")
+PROJECT_DIR = Path("/mnt/d/ai/aiaware")
+OUTPUT_DIR  = LOCAL_DIR / "output"
+FEEDS_FILE  = PROJECT_DIR / "feeds.json"
+CATALOG_FILE = PROJECT_DIR / "catalog.json"
+
+WHISPER_PY    = Path("/home/rwheeler/whisper-4090-venv/bin/python")
+TRANSCRIBE_PY = LOCAL_DIR / "transcribe_wsl.py"
+OLLAMA_URL    = "http://localhost:11434/api/generate"
+OLLAMA_MODEL  = "gemma4:e4b"
+
+HIGHLIGHT_PROMPT = """\
+You are an AI content intelligence analyst. Analyze this video transcript and produce a structured intelligence briefing.
+
+Format your response EXACTLY in these sections using markdown:
+
+## TL;DR
+One or two sentences maximum. The single most important thing to know from this video.
+
+## AI Tools & Technologies
+List every AI model, tool, framework, product, or company mentioned. For each:
+- **Name** — how it was discussed (announcement / criticism / comparison / hype / demo / pricing / etc.)
+
+## Key Insights
+The 5 most significant insights, claims, or findings. For each:
+**[MM:SS]** **Title** — Specific explanation. Quote actual words from the transcript when the phrasing is important.
+
+## Verbatim Quotes
+2-3 exact direct quotes worth saving. Format:
+> "[exact quote]" — [MM:SS]
+
+## Red Flags & Caveats
+Limitations, hype warnings, risks, important nuance, or contradictions raised in the video. Be blunt.
+
+## Action Items
+Concrete, specific things to do or investigate based on this content. Not generic advice.
+
+Rules:
+- Reference timestamps [MM:SS] from the timed transcript data — these will become clickable links
+- For quotes: use the actual words, not paraphrases
+- Flag opinion vs. fact when it matters
+- Skip filler language: "it's worth noting", "essentially", "basically", "interestingly"
+- If the video is thin on substance, say so plainly in TL;DR
+"""
+
+app = FastAPI(title="AIAware", version="2.0")
+app.mount("/static", StaticFiles(directory=str(PROJECT_DIR / "static")), name="static")
+
+# vid → full job dict (all episodes, not just current)
+_jobs: dict[str, dict] = {}
+_latest_vid: Optional[str] = None
+_running_vid: Optional[str] = None
+_lock = threading.Lock()
+_done_today: set[str] = set()
+
+
+class TriggerRequest(BaseModel):
+    url: Optional[str] = None
+    force: bool = False
+
+
+def _load_feeds() -> list[dict]:
+    if not FEEDS_FILE.exists():
+        return []
+    try:
+        return json.loads(FEEDS_FILE.read_text())
+    except Exception as e:
+        print(f"[feeds] error: {e}", flush=True)
+        return []
+
+
+def _video_id(url: str) -> str:
+    m = re.search(r"(?:v=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else re.sub(r"[^A-Za-z0-9_-]", "", url)[:20]
+
+
+def _fmt_date(yyyymmdd: str) -> str:
+    try:
+        return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
+    except Exception:
+        return yyyymmdd
+
+
+def _srt_to_timed_text(srt_path: Path) -> str:
+    if not srt_path.exists():
+        return ""
+    lines, ts_label = [], "[00:00]"
+    for raw in srt_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if re.match(r"^\d+$", line):
+            continue
+        if "-->" in line:
+            start = line.split("-->")[0].strip()
+            parts = start.replace(",", ".").split(":")
+            try:
+                h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
+                total = int(h * 3600 + m * 60 + s)
+                ts_label = f"[{total // 60:02d}:{total % 60:02d}]"
+            except Exception:
+                ts_label = "[??:??]"
+        elif line:
+            lines.append(f"{ts_label} {line}")
+    return "\n".join(lines)
+
+
+def _get_meta(vid: str) -> dict:
+    """Extract title, upload_date, channel from yt-dlp info json."""
+    info_path = LOCAL_DIR / "tmp" / f"{vid}.info.json"
+    if info_path.exists():
+        try:
+            d = json.loads(info_path.read_text())
+            return {
+                "title": d.get("title", vid),
+                "upload_date": _fmt_date(d.get("upload_date", "")),
+                "channel": d.get("channel", ""),
+                "channel_url": d.get("channel_url", ""),
+            }
+        except Exception:
+            pass
+    return {"title": vid, "upload_date": "", "channel": "", "channel_url": ""}
+
+
+def _save_catalog():
+    """Persist all completed episodes to catalog.json."""
+    with _lock:
+        episodes = [
+            {k: v for k, v in j.items() if k != "analysis"}
+            for j in _jobs.values()
+            if j.get("status") == "ready"
+        ]
+    episodes.sort(key=lambda e: e.get("upload_date", ""), reverse=True)
+    CATALOG_FILE.write_text(json.dumps(episodes, indent=2), encoding="utf-8")
+
+
+def _run_transcribe(url: str) -> tuple[bool, str, Optional[Path]]:
+    vid = _video_id(url)
+    cached_txt = OUTPUT_DIR / vid / f"{vid}.txt"
+    cached_srt = OUTPUT_DIR / vid / f"{vid}.srt"
+    if cached_txt.exists():
+        print(f"[transcribe] cached: {cached_txt}", flush=True)
+        return True, vid, cached_srt if cached_srt.exists() else None
+    cmd = [str(WHISPER_PY), str(TRANSCRIBE_PY), url, "--lang", "en"]
+    print(f"[transcribe] {url}", flush=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        print(f"[transcribe] FAILED:\n{r.stderr[-1000:]}", flush=True)
+        return False, vid, None
+    return True, vid, cached_srt if cached_srt.exists() else None
+
+
+def _run_analysis(vid: str, srt_path: Optional[Path], url: str) -> tuple[bool, str]:
+    txt_path = OUTPUT_DIR / vid / f"{vid}.txt"
+    if not txt_path.exists():
+        return False, "Transcript not found"
+
+    # Check for cached aiaware analysis
+    cached = OUTPUT_DIR / vid / f"{vid}.aiaware.txt"
+    if cached.exists():
+        raw = cached.read_text(encoding="utf-8")
+        analysis = raw.split("--- ANALYSIS ---", 1)[1].strip() if "--- ANALYSIS ---" in raw else raw
+        print(f"[analyze] using cached: {cached}", flush=True)
+        return True, analysis
+
+    transcript = txt_path.read_text(encoding="utf-8")
+    timed = _srt_to_timed_text(srt_path) if srt_path else ""
+    content = f"=== TIMED TRANSCRIPT ===\n{timed}\n\n=== FULL TRANSCRIPT ===\n{transcript}" if timed else transcript
+    MAX_CHARS = 28000
+    if len(content) > MAX_CHARS:
+        content = content[:MAX_CHARS] + "\n[truncated]"
+
+    full_prompt = f"{HIGHLIGHT_PROMPT}\n\n{content}"
+    body = {
+        "model": OLLAMA_MODEL, "prompt": full_prompt, "stream": True,
+        "keep_alive": 0, "options": {"num_ctx": 16384, "temperature": 0.3},
+    }
+    print(f"[analyze] calling {OLLAMA_MODEL}", flush=True)
+    req = urllib.request.Request(
+        OLLAMA_URL, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    parts = []
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            for line in resp:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                chunk = obj.get("response", "")
+                if chunk:
+                    parts.append(chunk)
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+    except Exception as e:
+        return False, f"Ollama error: {e}"
+
+    analysis = "".join(parts).strip()
+    cached.write_text(
+        f"URL: {url}\nMODEL: {OLLAMA_MODEL}\nDATE: {datetime.now().isoformat()}\n"
+        f"PROMPT:\n{HIGHLIGHT_PROMPT}\n\n--- ANALYSIS ---\n{analysis}\n",
+        encoding="utf-8",
+    )
+    print(f"\n[analyze] saved to {cached}", flush=True)
+    return True, analysis
+
+
+def _process_job(url: str, feed_name: str = "manual"):
+    global _latest_vid, _running_vid
+    vid = _video_id(url)
+
+    with _lock:
+        _running_vid = vid
+        existing = _jobs.get(vid, {})
+        _jobs[vid] = {
+            **existing,
+            "vid": vid, "url": url, "feed_name": feed_name,
+            "status": "running", "step": "transcribing",
+            "analysis": None, "error": None,
+            "started_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+        }
+        _latest_vid = vid
+
+    try:
+        ok, vid, srt_path = _run_transcribe(url)
+        if not ok:
+            raise RuntimeError("Transcription failed")
+
+        with _lock:
+            _jobs[vid]["step"] = "analyzing"
+            _jobs[vid]["updated_at"] = datetime.now().isoformat()
+
+        ok, analysis = _run_analysis(vid, srt_path, url)
+        if not ok:
+            raise RuntimeError(f"Analysis failed: {analysis}")
+
+        meta = _get_meta(vid)
+        with _lock:
+            _jobs[vid].update({
+                "status": "ready", "step": "done",
+                "analysis": analysis,
+                "title": meta["title"],
+                "upload_date": meta["upload_date"],
+                "channel": meta["channel"],
+                "updated_at": datetime.now().isoformat(),
+                "completed_at": datetime.now().isoformat(),
+            })
+            _done_today.add(feed_name)
+            _latest_vid = vid
+
+        _save_catalog()
+
+    except Exception as e:
+        print(f"[job] ERROR: {e}", flush=True)
+        with _lock:
+            _jobs[vid].update({
+                "status": "error", "error": str(e),
+                "updated_at": datetime.now().isoformat(),
+            })
+    finally:
+        with _lock:
+            if _running_vid == vid:
+                _running_vid = None
+
+
+def _get_latest_channel_url(feed: dict) -> Optional[str]:
+    """Use yt-dlp to resolve channel → latest video URL."""
+    channel_url = feed.get("url")
+    if not channel_url:
+        return None
+    # If it's a direct video URL, return as-is
+    if re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", channel_url):
+        return channel_url
+    # Channel URL — get latest video
+    cmd = [str(WHISPER_PY), "-m", "yt_dlp",
+           "--playlist-end", "1", "--dump-json", "--no-playlist", channel_url]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if r.returncode == 0 and r.stdout.strip():
+            info = json.loads(r.stdout.strip().splitlines()[0])
+            vid = info.get("id")
+            return f"https://www.youtube.com/watch?v={vid}" if vid else None
+    except Exception as e:
+        print(f"[scheduler] channel resolve failed: {e}", flush=True)
+    return None
+
+
+def _scheduler():
+    while True:
+        time.sleep(300)
+        feeds = _load_feeds()
+        today = date.today().isoformat()
+        now = datetime.now()
+
+        for feed in feeds:
+            name = feed.get("name", "default")
+            schedule_hour = int(feed.get("schedule_hour", 10))
+            if now.hour < schedule_hour:
+                continue
+
+            done_key = f"{name}:{today}"
+            with _lock:
+                if done_key in _done_today or _running_vid:
+                    continue
+
+            # Check if today already in catalog
+            with _lock:
+                already = any(
+                    j.get("upload_date") == today and j.get("status") == "ready"
+                    for j in _jobs.values()
+                )
+            if already:
+                with _lock:
+                    _done_today.add(done_key)
+                continue
+
+            url = _get_latest_channel_url(feed)
+            if not url:
+                continue
+
+            print(f"[scheduler] triggering {name}", flush=True)
+            with _lock:
+                _done_today.add(done_key)
+            threading.Thread(target=_process_job, args=(url, name), daemon=True).start()
+
+
+def _startup_recover():
+    """Load ALL past aiaware analyses into _jobs."""
+    global _latest_vid
+    loaded = []
+    for apath in OUTPUT_DIR.glob("*/*.aiaware.txt"):
+        vid = apath.parent.name
+        try:
+            raw = apath.read_text(encoding="utf-8")
+            url = ""
+            for line in raw.splitlines()[:5]:
+                if line.startswith("URL: "):
+                    url = line[5:].strip()
+                    break
+            analysis = raw.split("--- ANALYSIS ---", 1)[1].strip() if "--- ANALYSIS ---" in raw else raw
+            meta = _get_meta(vid)
+            mtime = apath.stat().st_mtime
+            _jobs[vid] = {
+                "vid": vid, "url": url, "feed_name": "restored",
+                "status": "ready", "step": "done",
+                "analysis": analysis,
+                "title": meta["title"],
+                "upload_date": meta["upload_date"],
+                "channel": meta["channel"],
+                "error": None,
+                "started_at": datetime.fromtimestamp(mtime).isoformat(),
+                "updated_at": datetime.fromtimestamp(mtime).isoformat(),
+                "completed_at": datetime.fromtimestamp(mtime).isoformat(),
+            }
+            loaded.append((meta["upload_date"] or datetime.fromtimestamp(mtime).isoformat(), vid))
+        except Exception as e:
+            print(f"[startup] skip {apath}: {e}", flush=True)
+
+    if loaded:
+        loaded.sort(reverse=True)
+        _latest_vid = loaded[0][1]
+        print(f"[startup] restored {len(loaded)} episodes, latest: {_latest_vid}", flush=True)
+        _save_catalog()
+
+
+@app.on_event("startup")
+def startup():
+    _startup_recover()
+    threading.Thread(target=_scheduler, daemon=True).start()
+    print(f"[startup] AIAware v2 on port {PORT}", flush=True)
+
+
+@app.get("/")
+def index():
+    return FileResponse(str(PROJECT_DIR / "static" / "index.html"))
+
+
+@app.get("/api/status")
+def status():
+    with _lock:
+        job = _jobs.get(_latest_vid) if _latest_vid else None
+        running = _running_vid
+    return {
+        "job": job,
+        "running": running,
+        "feeds": _load_feeds(),
+        "server_time": datetime.now().isoformat(),
+    }
+
+
+@app.get("/api/episodes")
+def episodes():
+    with _lock:
+        eps = [
+            {k: v for k, v in j.items() if k != "analysis"}
+            for j in _jobs.values()
+            if j.get("status") in ("ready", "running", "error")
+        ]
+    eps.sort(key=lambda e: e.get("upload_date") or e.get("started_at", ""), reverse=True)
+    return eps
+
+
+@app.get("/api/episode/{vid}")
+def episode(vid: str):
+    with _lock:
+        job = _jobs.get(vid)
+    if not job:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return job
+
+
+@app.post("/api/trigger")
+def trigger(req: TriggerRequest, background_tasks: BackgroundTasks):
+    feeds = _load_feeds()
+    url = req.url
+    if not url:
+        url = _get_latest_channel_url(feeds[0]) if feeds else None
+    if not url:
+        return JSONResponse({"error": "No URL and no feeds configured"}, status_code=400)
+
+    with _lock:
+        if _running_vid and not req.force:
+            return JSONResponse({"error": f"Already running: {_running_vid}"}, status_code=409)
+
+    background_tasks.add_task(_process_job, url, "manual")
+    return {"message": f"Triggered: {url}", "vid": _video_id(url)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
