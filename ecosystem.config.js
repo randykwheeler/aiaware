@@ -7,6 +7,7 @@ module.exports = {
       AIAWARE_MODE: 'reader',
       AIAWARE_PORT: '10073',
       AIAWARE_DIR: '/root/aiaware',
+      AIAWARE_DATA_DIR: '/root/aiaware-data',
       PYTHONUNBUFFERED: '1'
     },
     restart_delay: 3000,
