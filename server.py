@@ -1,8 +1,11 @@
 """
 aiaware/server.py — AI content awareness pipeline.
-FastAPI on port 11440. Transcribes + analyzes daily AI videos via 4090 Whisper + Ollama.
+FastAPI on port 11440 (pipeline) or 10073 (reader/70-machine).
+
+AIAWARE_MODE=pipeline  (default) — full pipeline: Whisper + Ollama + daily scheduler
+AIAWARE_MODE=reader               — static reader: serves catalog.json pushed by pipeline machine
 """
-import json, sys, re, threading, time, subprocess, urllib.request, urllib.error
+import json, sys, re, os, threading, time, subprocess, urllib.request, urllib.error
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
@@ -12,12 +15,19 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-PORT        = 11440
-LOCAL_DIR   = Path("/mnt/d/ai/local")
-PROJECT_DIR = Path("/mnt/d/ai/aiaware")
-OUTPUT_DIR  = LOCAL_DIR / "output"
-FEEDS_FILE  = PROJECT_DIR / "feeds.json"
+MODE = os.environ.get("AIAWARE_MODE", "pipeline")  # "pipeline" | "reader"
+PORT = int(os.environ.get("AIAWARE_PORT", "11440" if MODE == "pipeline" else "10073"))
+
+LOCAL_DIR    = Path("/mnt/d/ai/local")
+PROJECT_DIR  = Path(os.environ.get("AIAWARE_DIR", "/mnt/d/ai/aiaware"))
+OUTPUT_DIR   = LOCAL_DIR / "output"
+FEEDS_FILE   = PROJECT_DIR / "feeds.json"
 CATALOG_FILE = PROJECT_DIR / "catalog.json"
+
+# Remote 70-machine sync (pipeline mode only)
+REMOTE_HOST      = os.environ.get("AIAWARE_REMOTE_HOST", "root@70.36.101.83")
+REMOTE_CATALOG   = os.environ.get("AIAWARE_REMOTE_CATALOG", "~/aiaware/catalog.json")
+REMOTE_SSH_KEY   = os.environ.get("AIAWARE_SSH_KEY", "/home/rwheeler/.ssh/granbury_70")
 
 WHISPER_PY    = Path("/home/rwheeler/whisper-4090-venv/bin/python")
 TRANSCRIBE_PY = LOCAL_DIR / "transcribe_wsl.py"
@@ -61,7 +71,6 @@ Rules:
 app = FastAPI(title="AIAware", version="2.0")
 app.mount("/static", StaticFiles(directory=str(PROJECT_DIR / "static")), name="static")
 
-# vid → full job dict (all episodes, not just current)
 _jobs: dict[str, dict] = {}
 _latest_vid: Optional[str] = None
 _running_vid: Optional[str] = None
@@ -73,6 +82,8 @@ class TriggerRequest(BaseModel):
     url: Optional[str] = None
     force: bool = False
 
+
+# ── helpers ──────────────────────────────────────────────────────────────────
 
 def _load_feeds() -> list[dict]:
     if not FEEDS_FILE.exists():
@@ -119,7 +130,6 @@ def _srt_to_timed_text(srt_path: Path) -> str:
 
 
 def _get_meta(vid: str) -> dict:
-    """Extract title, upload_date, channel from yt-dlp info json."""
     info_path = LOCAL_DIR / "tmp" / f"{vid}.info.json"
     if info_path.exists():
         try:
@@ -136,16 +146,46 @@ def _get_meta(vid: str) -> dict:
 
 
 def _save_catalog():
-    """Persist all completed episodes to catalog.json."""
+    """Persist all completed episodes (including full analysis) to catalog.json."""
     with _lock:
-        episodes = [
-            {k: v for k, v in j.items() if k != "analysis"}
-            for j in _jobs.values()
-            if j.get("status") == "ready"
-        ]
+        episodes = [dict(j) for j in _jobs.values() if j.get("status") == "ready"]
     episodes.sort(key=lambda e: e.get("upload_date", ""), reverse=True)
     CATALOG_FILE.write_text(json.dumps(episodes, indent=2), encoding="utf-8")
 
+
+def _sync_to_remote():
+    """Push catalog.json to 70 machine via SSH. Fire-and-forget on failure."""
+    if not CATALOG_FILE.exists():
+        return
+    try:
+        data = CATALOG_FILE.read_bytes()
+        cmd = [
+            "ssh", "-i", REMOTE_SSH_KEY,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=10",
+            REMOTE_HOST,
+            f"cat > {REMOTE_CATALOG}",
+        ]
+        r = subprocess.run(cmd, input=data, timeout=20)
+        if r.returncode == 0:
+            print(f"[sync] catalog pushed to {REMOTE_HOST}", flush=True)
+        else:
+            print(f"[sync] WARNING: SSH returned {r.returncode}", flush=True)
+    except Exception as e:
+        print(f"[sync] WARNING: {e}", flush=True)
+
+
+def _load_catalog() -> list[dict]:
+    """Reader-mode: load episodes from catalog.json."""
+    if not CATALOG_FILE.exists():
+        return []
+    try:
+        return json.loads(CATALOG_FILE.read_text())
+    except Exception:
+        return []
+
+
+# ── pipeline (pipeline mode only) ────────────────────────────────────────────
 
 def _run_transcribe(url: str) -> tuple[bool, str, Optional[Path]]:
     vid = _video_id(url)
@@ -168,31 +208,28 @@ def _run_analysis(vid: str, srt_path: Optional[Path], url: str) -> tuple[bool, s
     if not txt_path.exists():
         return False, "Transcript not found"
 
-    # Check for cached aiaware analysis
     cached = OUTPUT_DIR / vid / f"{vid}.aiaware.txt"
     if cached.exists():
         raw = cached.read_text(encoding="utf-8")
         analysis = raw.split("--- ANALYSIS ---", 1)[1].strip() if "--- ANALYSIS ---" in raw else raw
-        print(f"[analyze] using cached: {cached}", flush=True)
+        print(f"[analyze] cached: {cached}", flush=True)
         return True, analysis
 
     transcript = txt_path.read_text(encoding="utf-8")
     timed = _srt_to_timed_text(srt_path) if srt_path else ""
     content = f"=== TIMED TRANSCRIPT ===\n{timed}\n\n=== FULL TRANSCRIPT ===\n{transcript}" if timed else transcript
-    MAX_CHARS = 28000
-    if len(content) > MAX_CHARS:
-        content = content[:MAX_CHARS] + "\n[truncated]"
+    if len(content) > 28000:
+        content = content[:28000] + "\n[truncated]"
 
-    full_prompt = f"{HIGHLIGHT_PROMPT}\n\n{content}"
     body = {
-        "model": OLLAMA_MODEL, "prompt": full_prompt, "stream": True,
-        "keep_alive": 0, "options": {"num_ctx": 16384, "temperature": 0.3},
+        "model": OLLAMA_MODEL,
+        "prompt": f"{HIGHLIGHT_PROMPT}\n\n{content}",
+        "stream": True, "keep_alive": 0,
+        "options": {"num_ctx": 16384, "temperature": 0.3},
     }
     print(f"[analyze] calling {OLLAMA_MODEL}", flush=True)
-    req = urllib.request.Request(
-        OLLAMA_URL, data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-    )
+    req = urllib.request.Request(OLLAMA_URL, data=json.dumps(body).encode(),
+                                  headers={"Content-Type": "application/json"})
     parts = []
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
@@ -200,8 +237,7 @@ def _run_analysis(vid: str, srt_path: Optional[Path], url: str) -> tuple[bool, s
                 line = line.strip()
                 if not line:
                     continue
-                obj = json.loads(line)
-                chunk = obj.get("response", "")
+                chunk = json.loads(line).get("response", "")
                 if chunk:
                     parts.append(chunk)
                     sys.stdout.write(chunk)
@@ -215,7 +251,7 @@ def _run_analysis(vid: str, srt_path: Optional[Path], url: str) -> tuple[bool, s
         f"PROMPT:\n{HIGHLIGHT_PROMPT}\n\n--- ANALYSIS ---\n{analysis}\n",
         encoding="utf-8",
     )
-    print(f"\n[analyze] saved to {cached}", flush=True)
+    print(f"\n[analyze] saved {cached}", flush=True)
     return True, analysis
 
 
@@ -225,9 +261,8 @@ def _process_job(url: str, feed_name: str = "manual"):
 
     with _lock:
         _running_vid = vid
-        existing = _jobs.get(vid, {})
         _jobs[vid] = {
-            **existing,
+            **_jobs.get(vid, {}),
             "vid": vid, "url": url, "feed_name": feed_name,
             "status": "running", "step": "transcribing",
             "analysis": None, "error": None,
@@ -264,14 +299,13 @@ def _process_job(url: str, feed_name: str = "manual"):
             _latest_vid = vid
 
         _save_catalog()
+        _sync_to_remote()
 
     except Exception as e:
         print(f"[job] ERROR: {e}", flush=True)
         with _lock:
-            _jobs[vid].update({
-                "status": "error", "error": str(e),
-                "updated_at": datetime.now().isoformat(),
-            })
+            _jobs[vid].update({"status": "error", "error": str(e),
+                                "updated_at": datetime.now().isoformat()})
     finally:
         with _lock:
             if _running_vid == vid:
@@ -279,21 +313,17 @@ def _process_job(url: str, feed_name: str = "manual"):
 
 
 def _get_latest_channel_url(feed: dict) -> Optional[str]:
-    """Use yt-dlp to resolve channel → latest video URL."""
     channel_url = feed.get("url")
     if not channel_url:
         return None
-    # If it's a direct video URL, return as-is
     if re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", channel_url):
         return channel_url
-    # Channel URL — get latest video
     cmd = [str(WHISPER_PY), "-m", "yt_dlp",
            "--playlist-end", "1", "--dump-json", "--no-playlist", channel_url]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if r.returncode == 0 and r.stdout.strip():
-            info = json.loads(r.stdout.strip().splitlines()[0])
-            vid = info.get("id")
+            vid = json.loads(r.stdout.strip().splitlines()[0]).get("id")
             return f"https://www.youtube.com/watch?v={vid}" if vid else None
     except Exception as e:
         print(f"[scheduler] channel resolve failed: {e}", flush=True)
@@ -306,19 +336,14 @@ def _scheduler():
         feeds = _load_feeds()
         today = date.today().isoformat()
         now = datetime.now()
-
         for feed in feeds:
             name = feed.get("name", "default")
-            schedule_hour = int(feed.get("schedule_hour", 10))
-            if now.hour < schedule_hour:
+            if now.hour < int(feed.get("schedule_hour", 10)):
                 continue
-
             done_key = f"{name}:{today}"
             with _lock:
                 if done_key in _done_today or _running_vid:
                     continue
-
-            # Check if today already in catalog
             with _lock:
                 already = any(
                     j.get("upload_date") == today and j.get("status") == "ready"
@@ -328,30 +353,23 @@ def _scheduler():
                 with _lock:
                     _done_today.add(done_key)
                 continue
-
             url = _get_latest_channel_url(feed)
             if not url:
                 continue
-
             print(f"[scheduler] triggering {name}", flush=True)
             with _lock:
                 _done_today.add(done_key)
             threading.Thread(target=_process_job, args=(url, name), daemon=True).start()
 
 
-def _startup_recover():
-    """Load ALL past aiaware analyses into _jobs."""
+def _startup_recover_pipeline():
     global _latest_vid
     loaded = []
     for apath in OUTPUT_DIR.glob("*/*.aiaware.txt"):
         vid = apath.parent.name
         try:
             raw = apath.read_text(encoding="utf-8")
-            url = ""
-            for line in raw.splitlines()[:5]:
-                if line.startswith("URL: "):
-                    url = line[5:].strip()
-                    break
+            url = next((l[5:].strip() for l in raw.splitlines()[:5] if l.startswith("URL: ")), "")
             analysis = raw.split("--- ANALYSIS ---", 1)[1].strip() if "--- ANALYSIS ---" in raw else raw
             meta = _get_meta(vid)
             mtime = apath.stat().st_mtime
@@ -359,10 +377,8 @@ def _startup_recover():
                 "vid": vid, "url": url, "feed_name": "restored",
                 "status": "ready", "step": "done",
                 "analysis": analysis,
-                "title": meta["title"],
-                "upload_date": meta["upload_date"],
-                "channel": meta["channel"],
-                "error": None,
+                "title": meta["title"], "upload_date": meta["upload_date"],
+                "channel": meta["channel"], "error": None,
                 "started_at": datetime.fromtimestamp(mtime).isoformat(),
                 "updated_at": datetime.fromtimestamp(mtime).isoformat(),
                 "completed_at": datetime.fromtimestamp(mtime).isoformat(),
@@ -370,20 +386,42 @@ def _startup_recover():
             loaded.append((meta["upload_date"] or datetime.fromtimestamp(mtime).isoformat(), vid))
         except Exception as e:
             print(f"[startup] skip {apath}: {e}", flush=True)
-
     if loaded:
         loaded.sort(reverse=True)
         _latest_vid = loaded[0][1]
         print(f"[startup] restored {len(loaded)} episodes, latest: {_latest_vid}", flush=True)
         _save_catalog()
+        _sync_to_remote()
 
+
+def _startup_recover_reader():
+    """Reader mode: load from catalog.json pushed by pipeline machine."""
+    global _latest_vid
+    episodes = _load_catalog()
+    for ep in episodes:
+        vid = ep.get("vid")
+        if vid:
+            _jobs[vid] = ep
+    if episodes:
+        _latest_vid = episodes[0].get("vid")
+        print(f"[startup] reader: loaded {len(episodes)} episodes from catalog", flush=True)
+    else:
+        print("[startup] reader: catalog.json empty or missing — waiting for sync", flush=True)
+
+
+# ── startup ───────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 def startup():
-    _startup_recover()
-    threading.Thread(target=_scheduler, daemon=True).start()
-    print(f"[startup] AIAware v2 on port {PORT}", flush=True)
+    if MODE == "pipeline":
+        _startup_recover_pipeline()
+        threading.Thread(target=_scheduler, daemon=True).start()
+    else:
+        _startup_recover_reader()
+    print(f"[startup] AIAware v2 mode={MODE} port={PORT}", flush=True)
 
+
+# ── routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def index():
@@ -394,11 +432,11 @@ def index():
 def status():
     with _lock:
         job = _jobs.get(_latest_vid) if _latest_vid else None
-        running = _running_vid
+        running = _running_vid if MODE == "pipeline" else None
     return {
         "job": job,
         "running": running,
-        "feeds": _load_feeds(),
+        "feeds": _load_feeds() if MODE == "pipeline" else [],
         "server_time": datetime.now().isoformat(),
     }
 
@@ -426,19 +464,34 @@ def episode(vid: str):
 
 @app.post("/api/trigger")
 def trigger(req: TriggerRequest, background_tasks: BackgroundTasks):
+    if MODE == "reader":
+        return JSONResponse({"error": "This node is read-only"}, status_code=403)
     feeds = _load_feeds()
-    url = req.url
-    if not url:
-        url = _get_latest_channel_url(feeds[0]) if feeds else None
+    url = req.url or (_get_latest_channel_url(feeds[0]) if feeds else None)
     if not url:
         return JSONResponse({"error": "No URL and no feeds configured"}, status_code=400)
-
     with _lock:
         if _running_vid and not req.force:
             return JSONResponse({"error": f"Already running: {_running_vid}"}, status_code=409)
-
     background_tasks.add_task(_process_job, url, "manual")
     return {"message": f"Triggered: {url}", "vid": _video_id(url)}
+
+
+@app.post("/api/reload")
+def reload_catalog():
+    """Reader mode: reload catalog.json from disk (called after remote sync)."""
+    if MODE == "pipeline":
+        return JSONResponse({"error": "Not in reader mode"}, status_code=400)
+    global _latest_vid
+    episodes = _load_catalog()
+    with _lock:
+        _jobs.clear()
+        for ep in episodes:
+            vid = ep.get("vid")
+            if vid:
+                _jobs[vid] = ep
+        _latest_vid = episodes[0].get("vid") if episodes else None
+    return {"loaded": len(episodes)}
 
 
 if __name__ == "__main__":
