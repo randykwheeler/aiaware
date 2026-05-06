@@ -39,37 +39,49 @@ OLLAMA_URL    = "http://localhost:11434/api/generate"
 OLLAMA_MODEL  = "gemma4:e4b"
 
 HIGHLIGHT_PROMPT = """\
-You are an AI content intelligence analyst. Analyze this video transcript and produce a structured intelligence briefing.
+You are an AI content intelligence analyst. Analyze this video transcript and produce a structured intelligence briefing. Be analytical, not descriptive — your job is to extract signal, not summarize.
 
 Format your response EXACTLY in these sections using markdown:
 
 ## TL;DR
-One or two sentences maximum. The single most important thing to know from this video.
+2-3 sentences. Lead with the single sharpest claim or insight. End with one sentence on why it matters right now. If the video is thin on substance, say so explicitly — do not pad.
+
+## Speaker & Source Context
+One short paragraph. Who is the speaker, what is their apparent background and expertise, and what is their likely angle or bias? Is this opinion, reporting, or a technical demonstration? Note if the speaker has skin in the game (sells something, represents a company, etc.).
 
 ## AI Tools & Technologies
-List every AI model, tool, framework, product, or company mentioned. For each:
-- **Name** — how it was discussed (announcement / criticism / comparison / hype / demo / pricing / etc.)
+Every AI model, tool, framework, product, or company mentioned. For each:
+- **Name** `[open/closed/open-weight]` — what was said, and whether it was a demo, announcement, criticism, pricing mention, comparison, or hype. Note maturity level if inferable (experimental / production / deprecated).
 
 ## Key Insights
-The 5 most significant insights, claims, or findings. For each:
-**[MM:SS]** **Title** — Specific explanation. Quote actual words from the transcript when the phrasing is important.
+The 7 most significant insights, claims, or findings — ordered by importance, not by when they appear. For each, include a tag:
+**[MM:SS]** `[FACT]` / `[OPINION]` / `[CLAIM-UNVERIFIED]` **Title** — Specific explanation. Use the speaker's actual words when the phrasing matters. Explain WHY it's significant, not just what was said.
+
+## Market & Business Signals
+Competitive moves, pricing signals, acquisitions, partnerships, launches, or strategic positioning mentioned or implied. If none, write "None detected." Do not invent signals.
 
 ## Verbatim Quotes
-2-3 exact direct quotes worth saving. Format:
+4-5 exact direct quotes worth keeping. Choose for insight density, not just quotability. Format:
 > "[exact quote]" — [MM:SS]
 
+## Contrarian Angle
+What is NOT being said? What assumptions go unchallenged? What claims are testable but untested? Where does the speaker oversimplify, hedge, or sidestep? Be specific — vague skepticism is useless.
+
 ## Red Flags & Caveats
-Limitations, hype warnings, risks, important nuance, or contradictions raised in the video. Be blunt.
+Hype warnings, conflicts of interest, logical gaps, missing context, or risks. Be blunt and specific. If the video is balanced and rigorous, say so.
 
 ## Action Items
-Concrete, specific things to do or investigate based on this content. Not generic advice.
+Concrete, specific things to do or investigate. Add priority:
+- `[HIGH]` — time-sensitive or high-leverage
+- `[MED]` — worth doing but not urgent
+- `[LOW]` — interesting but optional
 
 Rules:
-- Reference timestamps [MM:SS] from the timed transcript data — these will become clickable links
-- For quotes: use the actual words, not paraphrases
-- Flag opinion vs. fact when it matters
-- Skip filler language: "it's worth noting", "essentially", "basically", "interestingly"
-- If the video is thin on substance, say so plainly in TL;DR
+- Timestamps [MM:SS] from the timed transcript will become clickable links — use them
+- Use the speaker's actual words for quotes, never paraphrase
+- FACT = verifiable claim. OPINION = stated as opinion or clearly subjective. CLAIM-UNVERIFIED = stated as fact but not backed by evidence in the video.
+- Skip filler: "it's worth noting", "essentially", "basically", "interestingly", "in a nutshell"
+- Analytical language only — describe what the evidence shows, not what is "fascinating" or "exciting"
 """
 
 app = FastAPI(title="AIAware", version="3.0")
