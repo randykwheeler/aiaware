@@ -36,7 +36,11 @@ REMOTE_READER_URL  = os.environ.get("AIAWARE_REMOTE_URL",     "https://aiaware.s
 WHISPER_PY    = Path("/home/rwheeler/whisper-4090-venv/bin/python")
 TRANSCRIBE_PY = LOCAL_DIR / "transcribe_wsl.py"
 OLLAMA_URL    = "http://localhost:11434/api/generate"
-OLLAMA_MODEL  = "gemma4:e4b"
+OLLAMA_MODEL  = "qwen3:14b"  # fallback when no OpenRouter key
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL   = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3-235b-a22b-2507")
+OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 
 HIGHLIGHT_PROMPT = """\
 You are an AI content intelligence analyst. Analyze this video transcript and produce a structured intelligence briefing. Be analytical, not descriptive — your job is to extract signal, not summarize.
@@ -257,6 +261,65 @@ def _get_meta(vid: str) -> dict:
 
 # ── pipeline ──────────────────────────────────────────────────────────────────
 
+def _call_openrouter(content: str) -> tuple[str, str]:
+    """Call OpenRouter chat completions. Returns (analysis, error)."""
+    body = json.dumps({
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": f"{HIGHLIGHT_PROMPT}\n\n{content}"}],
+        "temperature": 0.3,
+        "max_tokens": 4096,
+    }).encode()
+    req = urllib.request.Request(
+        OPENROUTER_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://aiaware.stinkhead.net",
+        },
+    )
+    print(f"[analyze] calling OpenRouter {OPENROUTER_MODEL}", flush=True)
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            data = json.loads(resp.read())
+        text = data["choices"][0]["message"]["content"]
+        usage = data.get("usage", {})
+        cost = (usage.get("prompt_tokens", 0) * 0.071 + usage.get("completion_tokens", 0) * 0.100) / 1e6
+        print(f"[analyze] done — {usage.get('prompt_tokens','?')} in / {usage.get('completion_tokens','?')} out / ${cost:.5f}", flush=True)
+        return text, ""
+    except Exception as e:
+        return "", f"OpenRouter error: {e}"
+
+
+def _call_ollama(content: str) -> tuple[str, str]:
+    """Call local Ollama generate. Returns (analysis, error)."""
+    body = json.dumps({
+        "model": OLLAMA_MODEL,
+        "prompt": f"{HIGHLIGHT_PROMPT}\n\n{content}",
+        "stream": True, "keep_alive": 0,
+        "options": {"num_ctx": 16384, "temperature": 0.3},
+    }).encode()
+    req = urllib.request.Request(
+        OLLAMA_URL, data=body, headers={"Content-Type": "application/json"}
+    )
+    print(f"[analyze] calling local Ollama {OLLAMA_MODEL}", flush=True)
+    parts = []
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            for line in resp:
+                line = line.strip()
+                if not line:
+                    continue
+                chunk = json.loads(line).get("response", "")
+                if chunk:
+                    parts.append(chunk)
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+        return "".join(parts), ""
+    except Exception as e:
+        return "", f"Ollama error: {e}"
+
+
 def _run_transcribe(url: str) -> tuple[bool, str, Optional[Path]]:
     vid = _video_id(url)
     cached_txt = OUTPUT_DIR / vid / f"{vid}.txt"
@@ -291,33 +354,19 @@ def _run_analysis(vid: str, srt_path: Optional[Path], url: str) -> tuple[bool, s
     if len(content) > 28000:
         content = content[:28000] + "\n[truncated]"
 
-    body = {
-        "model": OLLAMA_MODEL,
-        "prompt": f"{HIGHLIGHT_PROMPT}\n\n{content}",
-        "stream": True, "keep_alive": 0,
-        "options": {"num_ctx": 16384, "temperature": 0.3},
-    }
-    print(f"[analyze] calling {OLLAMA_MODEL}", flush=True)
-    req = urllib.request.Request(OLLAMA_URL, data=json.dumps(body).encode(),
-                                  headers={"Content-Type": "application/json"})
-    parts = []
-    try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            for line in resp:
-                line = line.strip()
-                if not line:
-                    continue
-                chunk = json.loads(line).get("response", "")
-                if chunk:
-                    parts.append(chunk)
-                    sys.stdout.write(chunk)
-                    sys.stdout.flush()
-    except Exception as e:
-        return False, f"Ollama error: {e}"
+    if OPENROUTER_API_KEY:
+        analysis, err = _call_openrouter(content)
+        model_used = OPENROUTER_MODEL
+    else:
+        analysis, err = _call_ollama(content)
+        model_used = OLLAMA_MODEL
 
-    analysis = "".join(parts).strip()
+    if err:
+        return False, err
+
+    analysis = analysis.strip()
     cached.write_text(
-        f"URL: {url}\nMODEL: {OLLAMA_MODEL}\nDATE: {datetime.now().isoformat()}\n"
+        f"URL: {url}\nMODEL: {model_used}\nDATE: {datetime.now().isoformat()}\n"
         f"PROMPT:\n{HIGHLIGHT_PROMPT}\n\n--- ANALYSIS ---\n{analysis}\n",
         encoding="utf-8",
     )
