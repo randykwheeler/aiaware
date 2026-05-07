@@ -55,7 +55,9 @@ One short paragraph. Who is the speaker, what is their apparent background and e
 
 ## AI Tools & Technologies
 Every AI model, tool, framework, product, or company mentioned. For each:
-- **Name** `[open/closed/open-weight]` — what was said, and whether it was a demo, announcement, criticism, pricing mention, comparison, or hype. Note maturity level if inferable (experimental / production / deprecated).
+- **[Name](url)** `[open/closed/open-weight]` — what was said, and whether it was a demo, announcement, criticism, pricing mention, comparison, or hype. Note maturity level if inferable (experimental / production / deprecated).
+
+For the URL: use the official site or most authoritative page you know (e.g. github repo, docs, product page). If you are not confident in the URL, omit the link and write **Name** without brackets.
 
 ## Key Insights
 The 7 most significant insights, claims, or findings — ordered by importance, not by when they appear. For each, include a tag:
@@ -370,7 +372,7 @@ def _run_analysis(vid: str, srt_path: Optional[Path], url: str) -> tuple[bool, s
         f"PROMPT:\n{HIGHLIGHT_PROMPT}\n\n--- ANALYSIS ---\n{analysis}\n",
         encoding="utf-8",
     )
-    print(f"\n[analyze] saved {cached}", flush=True)
+    print(f"[analyze] saved {cached}", flush=True)
     return True, analysis
 
 
