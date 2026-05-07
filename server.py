@@ -55,7 +55,12 @@ One short paragraph. Who is the speaker, what is their apparent background and e
 
 ## AI Tools & Technologies
 Every AI model, tool, framework, product, or company mentioned. For each:
-- **[Name](url)** `[open/closed/open-weight]` — what was said, and whether it was a demo, announcement, criticism, pricing mention, comparison, or hype. Note maturity level if inferable (experimental / production / deprecated).
+- **[Name](url)** `[tag]` — what was said, and whether it was a demo, announcement, criticism, pricing mention, comparison, or hype. Note maturity level if inferable (experimental / production / deprecated).
+
+Tag values:
+- `open` — fully open source: code, training pipeline, and weights are all publicly available (e.g. Mistral 7B, Llama 3)
+- `closed` — proprietary black box: no public weights, no source code (e.g. GPT-4o, Claude, Gemini)
+- `open-weight` — weights are public and downloadable but training code/data is not fully released (e.g. Qwen, Gemma, DeepSeek)
 
 For the URL: use the official site or most authoritative page you know (e.g. github repo, docs, product page). If you are not confident in the URL, omit the link and write **Name** without brackets.
 
