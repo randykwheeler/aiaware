@@ -10,10 +10,11 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Header, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
+from urllib.parse import urlparse
 
 MODE = os.environ.get("AIAWARE_MODE", "pipeline")  # "pipeline" | "reader"
 PORT = int(os.environ.get("AIAWARE_PORT", "11440" if MODE == "pipeline" else "10073"))
@@ -41,6 +42,36 @@ OLLAMA_MODEL  = "qwen3:14b"  # fallback when no OpenRouter key
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL   = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3-235b-a22b-2507")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
+
+# ── auth + URL allowlist (security hardening) ─────────────────────────────────
+ADMIN_TOKEN = os.environ.get("AIAWARE_ADMIN_TOKEN", "").strip()
+if MODE == "pipeline" and not ADMIN_TOKEN:
+    print("[fatal] AIAWARE_ADMIN_TOKEN not set — refusing to start pipeline mode "
+          "with /api/trigger unauthenticated. Set it in your env, then restart.",
+          flush=True)
+    sys.exit(2)
+
+# Hosts whose URLs we accept on /api/trigger. Allowlist prevents SSRF.
+ALLOWED_TRIGGER_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
+    "youtu.be",
+}
+
+def require_admin_token(x_admin_token: Optional[str] = Header(default=None)):
+    """FastAPI dependency: requires X-Admin-Token header matching env var."""
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="missing or invalid X-Admin-Token")
+    return True
+
+def _trigger_url_allowed(url: str) -> bool:
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    host = (p.hostname or "").lower()
+    return host in ALLOWED_TRIGGER_HOSTS
 
 HIGHLIGHT_PROMPT = """\
 You are an AI content intelligence analyst. Analyze this video transcript and produce a structured intelligence briefing. Be analytical, not descriptive — your job is to extract signal, not summarize.
@@ -268,8 +299,31 @@ def _get_meta(vid: str) -> dict:
 
 # ── pipeline ──────────────────────────────────────────────────────────────────
 
+DAILY_BUDGET_USD = float(os.environ.get("AIAWARE_DAILY_BUDGET", "5.00"))
+
+def _check_openrouter_budget() -> Optional[str]:
+    """Return error string if today's OpenRouter spend already exceeds budget.
+    Triggers fallback to Ollama. None on OK or check failure."""
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/auth/key",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read()).get("data", {}) or {}
+        daily = data.get("usage_daily", 0) or 0
+        if daily >= DAILY_BUDGET_USD:
+            return f"daily budget exceeded: ${daily:.2f} >= ${DAILY_BUDGET_USD:.2f}"
+    except Exception:
+        pass  # Don't block on probe failure
+    return None
+
+
 def _call_openrouter(content: str) -> tuple[str, str]:
     """Call OpenRouter chat completions. Returns (analysis, error)."""
+    over = _check_openrouter_budget()
+    if over:
+        return "", f"OpenRouter budget guardrail: {over} — using Ollama fallback"
     body = json.dumps({
         "model": OPENROUTER_MODEL,
         "messages": [{"role": "user", "content": f"{HIGHLIGHT_PROMPT}\n\n{content}"}],
@@ -364,6 +418,10 @@ def _run_analysis(vid: str, srt_path: Optional[Path], url: str) -> tuple[bool, s
     if OPENROUTER_API_KEY:
         analysis, err = _call_openrouter(content)
         model_used = OPENROUTER_MODEL
+        if err:
+            print(f"[analyze] OpenRouter failed ({err[:80]}) — falling back to Ollama {OLLAMA_MODEL}", flush=True)
+            analysis, err = _call_ollama(content)
+            model_used = f"{OLLAMA_MODEL} (fallback)"
     else:
         analysis, err = _call_ollama(content)
         model_used = OLLAMA_MODEL
@@ -610,9 +668,15 @@ def episode(vid: str):
 
 
 @app.post("/api/trigger")
-def trigger(req: TriggerRequest, background_tasks: BackgroundTasks):
+def trigger(req: TriggerRequest, background_tasks: BackgroundTasks,
+            _auth: bool = Depends(require_admin_token)):
     if MODE == "reader":
         return JSONResponse({"error": "This node is read-only"}, status_code=403)
+    if req.url and not _trigger_url_allowed(req.url):
+        return JSONResponse(
+            {"error": "URL host not in allowlist", "allowed": sorted(ALLOWED_TRIGGER_HOSTS)},
+            status_code=400,
+        )
     feeds = _load_feeds()
     url = req.url or (_get_latest_channel_url(feeds[0]) if feeds else None)
     if not url:

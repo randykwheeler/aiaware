@@ -5,5 +5,19 @@
     "url": "https://www.youtube.com/channel/UC0C-17n9iuUQPylguM1d-lQ/videos",
     "schedule_hour": 10,
     "note": "Daily AI strategy/news channel. yt-dlp pulls latest video automatically."
+  },
+  {
+    "name": "PreMarket Prep | Benzinga",
+    "channel": "@PreMarketPrep",
+    "url": "https://www.youtube.com/@PreMarketPrep/streams",
+    "schedule_hour": 9,
+    "note": "Benzinga PreMarket Prep daily livestream. Airs 8-9am ET; replay/audio-only posted same morning."
+  },
+  {
+    "name": "Mad Money | Jim Cramer (CNBC)",
+    "channel": "@CNBCMadMoney",
+    "url": "https://www.youtube.com/channel/UCrp_UI8XtuYfpiqluWLD7Lw/videos",
+    "schedule_hour": 19,
+    "note": "Jim Cramer Mad Money lightning round + featured picks. Airs weeknights ~6pm ET; full episode usually posted by 7-8pm ET."
   }
 ]
